@@ -1,0 +1,49 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE / Editor files
+.vscode/
+.idea/
+
+# Environment variables
+*.env
+.env.*
+
+# Byte-compiled files
+*.DS_Store
+
+# Python egg metadata
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+
+# SQLite DB (if using)
+*.sqlite3
+*.db
+
+# Pytest cache
+.pytest_cache/
+
+# MyPy cache
+.mypy_cache/
+
+# FastAPI static files (optional)
+static/
+
+# Pip
+pip-log.txt
+pip-wheel-metadata/
+
+# Virtual environment binaries
+Scripts/
