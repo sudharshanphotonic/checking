@@ -5,9 +5,9 @@ __pycache__/
 *.pyd
 
 # Virtual environment
-venv/
+venvi/
 env/
-.venv/
+.venvi/
 
 # IDE / Editor files
 .vscode/
