@@ -1,2 +1,36 @@
-._pycache_/
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.pkl
+
+# ---- Virtual environments ----
+venvi/
+env/
 .venvi/
+
+# ---- VSCode ----
+.vscode/
+.settings/
+
+# ---- Environment files ----
+*.env
+.env.*
+
+# ---- OS / Editor files ----
+.DS_Store
+Thumbs.db
+
+# ---- Logs ----
+*.log
+
+# ---- Python packaging ----
+build/
+dist/
+*.egg-info/
+
+# ---- Cache ----
+.cache/
+.pytest_cache/
