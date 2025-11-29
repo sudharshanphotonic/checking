@@ -1,8 +1,4 @@
-venvi/
 _pycache_/
-
+._pycache_
 .venvi/
-._pycache_/
-
-venvi
-_pycache_
+./venvi
