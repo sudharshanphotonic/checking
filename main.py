@@ -143,7 +143,8 @@
 
 import time
 import threading
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
+from datetime import datetime
 
 import jwt
 import paho.mqtt.client as mqtt
@@ -172,7 +173,7 @@ engine = create_engine(DATABASE_URL, future=True)
 metadata = MetaData()
 
 # -----------------------------
-# EXISTING TABLES
+# TABLES
 # -----------------------------
 users = Table(
     "users", metadata,
@@ -190,9 +191,7 @@ controllers = Table(
     Column("user_id", Integer, ForeignKey("users.id"), nullable=False),
 )
 
-# -----------------------------
-# TABLE: persist ACKs / status (for command responses)
-# -----------------------------
+# persist ACKs / status (for command responses)
 controller_status = Table(
     "controller_status", metadata,
     Column("id", Integer, primary_key=True),
@@ -201,9 +200,7 @@ controller_status = Table(
     Column("timestamp", Float, nullable=False),  # epoch seconds
 )
 
-# -----------------------------
-# TABLE: store ALL MQTT telemetry messages (history)
-# -----------------------------
+# store ALL MQTT telemetry messages (history)
 controller_telemetry = Table(
     "controller_telemetry", metadata,
     Column("id", Integer, primary_key=True),
@@ -217,8 +214,43 @@ controller_telemetry = Table(
     Column("received_at", Float, nullable=False),  # epoch seconds
 )
 
-# Create tables if they do not exist
+# last setting apply time per controller (c0 = 512)
+controller_last_setting = Table(
+    "controller_last_setting", metadata,
+    Column("controller_id", BigInteger, primary_key=True),
+    Column("set_time_raw", String, nullable=True),    # raw a3 like '051225163324'
+    Column("set_time_epoch", Float, nullable=True),   # parsed epoch seconds
+    Column("last_c0", String, nullable=True),         # should be '512'
+    Column("last_payload", Text, nullable=False),     # full ACK payload from device
+    Column("set_payload", Text, nullable=True),       # command we sent to controller
+)
+
+# Create tables if they do not exist (won't add new columns to existing tables)
 metadata.create_all(engine)
+
+# ✅ Ensure schema matches what we expect
+def ensure_controller_last_setting_schema():
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS controller_last_setting (
+                controller_id   BIGINT PRIMARY KEY,
+                set_time_raw    TEXT,
+                set_time_epoch  DOUBLE PRECISION,
+                last_c0         TEXT,
+                last_payload    TEXT NOT NULL,
+                set_payload     TEXT
+            );
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            ALTER TABLE controller_last_setting
+            ADD COLUMN IF NOT EXISTS set_payload TEXT;
+            """
+        )
+
+ensure_controller_last_setting_schema()
 
 # -----------------------------
 # FASTAPI + AUTH SETUP
@@ -265,7 +297,8 @@ def on_connect(client, userdata, flags, rc):
 
 
 def on_message(client, userdata, msg):
-    payload = msg.payload.decode(errors="ignore")
+    # strip() to remove trailing newlines
+    payload = msg.payload.decode(errors="ignore").strip()
     print("MQTT RECEIVED on", msg.topic, ":", payload)
 
     # Parse fields from payload string: d0, c0, a3, a4
@@ -281,7 +314,7 @@ def on_message(client, userdata, msg):
         elif p.startswith("c0="):
             c0_val = p.replace("c0=", "")
         elif p.startswith("a3="):
-            a3_val = p.replace("a3=", "")
+            a3_val = p.replace("a3=", "").strip()
         elif p.startswith("a4="):
             a4_val = p.replace("a4=", "")
 
@@ -432,12 +465,15 @@ def get_controllers(current_user: str = Depends(get_current_username)):
 def send_command(controller_id: int, command: CommandPayload, current_user: str = Depends(get_current_username)):
     """
     Validates that controller belongs to the current user, publishes MQTT command,
-    then waits (polling DB) for an ACK entry with timestamp > start (within timeout)
+    then waits (polling DB) for an ACK entry with timestamp > start (within timeout).
+    On a successful settings ACK (c0=512), we also store the sent setting payload
+    into controller_last_setting.
     """
     start_ts = time.time()
 
     try:
-        with engine.connect() as conn:
+        # ✅ use engine.begin so writes are committed
+        with engine.begin() as conn:
             # Validate controller ownership
             ctrl_q = select(controllers).where(
                 (controllers.c.controller_id == controller_id)
@@ -473,14 +509,69 @@ def send_command(controller_id: int, command: CommandPayload, current_user: str 
                 )
                 ack_row = conn.execute(ack_q).fetchone()
                 if ack_row and ack_row._mapping["timestamp"] > start_ts:
-                    print("RAW MQTT ACK PAYLOAD:", ack_row._mapping["payload"])
+                    ack_payload = (ack_row._mapping["payload"] or "").strip()
+                    ack_ts = ack_row._mapping["timestamp"]
+
+                    # Parse ACK payload to get c0 and a3
+                    parts = ack_payload.split("&")
+                    c0_val = None
+                    a3_val = None
+                    for p in parts:
+                        if p.startswith("c0="):
+                            c0_val = p[3:]
+                        elif p.startswith("a3="):
+                            a3_val = p[3:].strip()
+
+                    # Only if this is a successful settings ACK (c0=512)
+                    if c0_val == "512":
+                        # Parse a3 "ddmmyyHHMMSS" -> epoch seconds
+                        set_epoch = None
+                        if a3_val and len(a3_val) == 12 and a3_val.isdigit():
+                            day = int(a3_val[0:2])
+                            month = int(a3_val[2:4])
+                            year = 2000 + int(a3_val[4:6])
+                            hour = int(a3_val[6:8])
+                            minute = int(a3_val[8:10])
+                            second = int(a3_val[10:12])
+                            try:
+                                dt = datetime(year, month, day, hour, minute, second)
+                                set_epoch = dt.timestamp()
+                            except ValueError:
+                                set_epoch = None
+
+                        # UPSERT into controller_last_setting: include set_payload
+                        upd = (
+                            controller_last_setting.update()
+                            .where(controller_last_setting.c.controller_id == controller_id)
+                            .values(
+                                set_time_raw=a3_val,
+                                set_time_epoch=set_epoch,
+                                last_c0=c0_val,
+                                last_payload=ack_payload,
+                                set_payload=command.payload,  # what we sent
+                            )
+                        )
+                        result = conn.execute(upd)
+                        if result.rowcount == 0:
+                            conn.execute(
+                                insert(controller_last_setting).values(
+                                    controller_id=controller_id,
+                                    set_time_raw=a3_val,
+                                    set_time_epoch=set_epoch,
+                                    last_c0=c0_val,
+                                    last_payload=ack_payload,
+                                    set_payload=command.payload,
+                                )
+                            )
+
+                    print("RAW MQTT ACK PAYLOAD:", ack_payload)
                     return {
                         "status": "success",
                         "controller_id": controller_id,
                         "payload": command.payload,
                         "ack": "received",
-                        "ack_payload": ack_row._mapping["payload"],
-                        "ack_timestamp": ack_row._mapping["timestamp"],
+                        "ack_payload": ack_payload,
+                        "ack_timestamp": ack_ts,
                     }
                 time.sleep(poll_interval)
 
@@ -595,3 +686,68 @@ def controller_telemetry_endpoint(
 
     except SQLAlchemyError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+@app.get("/controller/{controller_id}/last-setting")
+def get_last_setting(controller_id: int, current_user: str = Depends(get_current_username)):
+    """
+    Returns the last successful settings apply info (c0=512) for this controller,
+    including the sent setting payload and device ACK payload.
+    """
+    try:
+        with engine.connect() as conn:
+            # Validate controller exists & ownership
+            ctrl = conn.execute(
+                select(controllers).where(controllers.c.controller_id == controller_id)
+            ).mappings().first()
+
+            if not ctrl:
+                raise HTTPException(status_code=404, detail="Controller not found")
+
+            user = conn.execute(
+                select(users).where(users.c.username == current_user)
+            ).mappings().first()
+
+            if not user or user.get("id") != ctrl.get("user_id"):
+                raise HTTPException(status_code=403, detail="Not authorized")
+
+            # Fetch the most recent stored last setting -- ensure ORDER BY for "last"
+            q = (
+                select(controller_last_setting)
+                .where(controller_last_setting.c.controller_id == controller_id)
+                .order_by(desc(controller_last_setting.c.set_time_epoch))
+                .limit(1)
+            )
+            last = conn.execute(q).mappings().first()
+
+            if not last:
+                return {"controller_id": controller_id, "status": "no_setting_found"}
+
+            # Normalize types
+            set_time_epoch = last.get("set_time_epoch")
+            if set_time_epoch is not None:
+                try:
+                    set_time_epoch = int(set_time_epoch)
+                except (TypeError, ValueError):
+                    # leave as-is or set to None if conversion fails
+                    set_time_epoch = None
+
+            return {
+                "controller_id": controller_id,
+                "status": "ok",
+                "sent_settings": last.get("set_payload"),
+                "device_ack": last.get("last_payload"),
+                "set_time_raw": last.get("set_time_raw"),
+                "set_time_epoch": set_time_epoch,
+            }
+
+    except SQLAlchemyError:
+        logger.exception("DB error while fetching last setting for controller %s", controller_id)
+        # Generic error detail to avoid leaking internals
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
