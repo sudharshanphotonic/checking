@@ -35,3 +35,5 @@ dist/
 # ---- Cache ----
 .cache/
 .pytest_cache/
+
+migrate_user.py/
